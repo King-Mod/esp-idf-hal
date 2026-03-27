@@ -6,10 +6,7 @@ use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
-use esp_idf_sys::{esp, EspError, TickType_t};
-
-#[cfg(esp_idf_version_major = "5")]
-use esp_idf_sys::i2s_port_t;
+use esp_idf_sys::{esp, i2s_port_t, EspError, TickType_t};
 
 #[cfg(not(esp_idf_version_major = "4"))]
 use {
@@ -50,10 +47,6 @@ mod std;
 ))]
 mod tdm;
 
-#[cfg(esp_idf_version_at_least_6_0_0)]
-#[allow(non_camel_case_types)]
-type i2s_port_t = i32;
-
 /// I2S channel base configuration.
 pub type I2sConfig = config::Config;
 
@@ -82,12 +75,10 @@ pub mod config {
         EspError, ESP_ERR_INVALID_ARG,
     };
 
-    #[cfg(esp_idf_version_major = "5")]
-    use esp_idf_sys::i2s_port_t;
     #[cfg(not(esp_idf_version_major = "4"))]
     use esp_idf_sys::{
         i2s_chan_config_t, i2s_clock_src_t, i2s_data_bit_width_t,
-        i2s_mclk_multiple_t_I2S_MCLK_MULTIPLE_512, i2s_role_t, i2s_slot_bit_width_t,
+        i2s_mclk_multiple_t_I2S_MCLK_MULTIPLE_512, i2s_port_t, i2s_role_t, i2s_slot_bit_width_t,
         i2s_slot_mode_t,
     };
 
@@ -104,10 +95,6 @@ pub mod config {
         all(esp_idf_version_major = "5", esp_idf_version_minor = "2"),
     )))] // ESP-IDF 5.3 and later
     use esp_idf_sys::i2s_chan_config_t__bindgen_ty_1; // introduces union type over auto_clear
-
-    #[cfg(esp_idf_version_at_least_6_0_0)]
-    #[allow(non_camel_case_types)]
-    type i2s_port_t = i32;
 
     /// The default number of DMA buffers to use.
     pub const DEFAULT_DMA_BUFFER_COUNT: u32 = 6;
@@ -530,8 +517,10 @@ mod sealed {
     pub trait Sealed {}
 
     impl Sealed for super::I2S0<'_> {}
-    #[cfg(any(esp32, esp32s3))]
+    #[cfg(any(esp32, esp32s3, esp32p4))]
     impl Sealed for super::I2S1<'_> {}
+    #[cfg(esp32p4)]
+    impl Sealed for super::I2S2<'_> {}
 }
 
 pub trait I2sPort {
@@ -546,9 +535,7 @@ pub trait I2sRxSupported {}
 ///
 /// Example usage:
 /// ```
-/// use esp_idf_hal::gpio::*;
-/// use esp_idf_hal::i2s::{config::{StdConfig, DataBitWidth}};
-/// use esp_idf_hal::i2s::{I2sDriver, I2sRx};
+/// use esp_idf_hal::i2s::{config::{StdConfig, DataBitWidth}, gpio::*};
 /// let std_config = StdConfig::philips(48000, DataBitWidth::Bits16);
 /// let peripherals = Peripherals::take().unwrap();
 /// let bclk = peripherals.pins.gpio1;
@@ -567,9 +554,7 @@ pub trait I2sTxSupported {}
 ///
 /// Example usage:
 /// ```
-/// use esp_idf_hal::gpio::*;
-/// use esp_idf_hal::i2s::{config::{StdConfig, DataBitWidth}};
-/// use esp_idf_hal::i2s::{I2sDriver, I2sTx};
+/// use esp_idf_hal::i2s::{config::{StdConfig, DataBitWidth}, gpio::*};
 /// let std_config = StdConfig::philips(48000, DataBitWidth::Bits16);
 /// let peripherals = Peripherals::take().unwrap();
 /// let bclk = peripherals.pins.gpio1;
@@ -585,9 +570,7 @@ impl I2sTxSupported for I2sTx {}
 ///
 /// Example usage:
 /// ```
-/// use esp_idf_hal::{gpio::*, peripherals::Peripherals};
-/// use esp_idf_hal::i2s::{config::{StdConfig, DataBitWidth}};
-/// use esp_idf_hal::i2s::{I2sDriver, I2sBiDir};
+/// use esp_idf_hal::i2s::{config::{StdConfig, DataBitWidth}, gpio::*, peripherals::Peripherals};
 /// let std_config = StdConfig::philips(48000, DataBitWidth::Bits16);
 /// let peripherals = Peripherals::take().unwrap();
 /// let bclk = peripherals.pins.gpio1;
@@ -1381,8 +1364,10 @@ macro_rules! impl_i2s {
 }
 
 impl_i2s!(I2S0: 0);
-#[cfg(any(esp32, esp32s3))]
+#[cfg(any(esp32, esp32s3, esp32p4))]
 impl_i2s!(I2S1: 1);
+#[cfg(esp32p4)]
+impl_i2s!(I2S2: 2);
 
 #[cfg(not(esp_idf_version_major = "4"))]
 #[cfg(not(any(esp32, esp32s3)))]

@@ -241,6 +241,8 @@ pub trait I2c: Send {
 
 pub struct I2cDriver<'d> {
     i2c: u8,
+    pub bus_handle: i2c_master_bus_handle_t,
+    baudrate: u32,
     _p: PhantomData<&'d mut ()>,
 }
 
@@ -256,40 +258,57 @@ impl<'d> I2cDriver<'d> {
             return Err(EspError::from_infallible::<ESP_ERR_INVALID_ARG>());
         }
 
-        let sys_config = i2c_config_t {
-            mode: i2c_mode_t_I2C_MODE_MASTER,
+        // Use the new I2C master bus API
+        let bus_config = i2c_master_bus_config_t {
+            i2c_port: I2C::port() as i32,
             sda_io_num: sda.pin() as _,
-            sda_pullup_en: config.sda_pullup_enabled,
             scl_io_num: scl.pin() as _,
-            scl_pullup_en: config.scl_pullup_enabled,
-            __bindgen_anon_1: i2c_config_t__bindgen_ty_1 {
-                master: i2c_config_t__bindgen_ty_1__bindgen_ty_1 {
-                    clk_speed: config.baudrate.into(),
-                },
+            __bindgen_anon_1: i2c_master_bus_config_t__bindgen_ty_1 {
+                clk_source: soc_periph_i2c_clk_src_t_I2C_CLK_SRC_DEFAULT,
             },
-            ..Default::default()
+            glitch_ignore_cnt: 7,
+            intr_priority: 0,
+            trans_queue_depth: 0,
+            flags: i2c_master_bus_config_t__bindgen_ty_2 {
+                _bitfield_1: i2c_master_bus_config_t__bindgen_ty_2::new_bitfield_1(
+                    if config.sda_pullup_enabled || config.scl_pullup_enabled {
+                        1
+                    } else {
+                        0
+                    },
+                    0, // allow_pd
+                ),
+                ..Default::default()
+            },
         };
 
-        esp!(unsafe { i2c_param_config(I2C::port(), &sys_config) })?;
-
-        esp!(unsafe {
-            i2c_driver_install(
-                I2C::port(),
-                i2c_mode_t_I2C_MODE_MASTER,
-                0, // Not used in master mode
-                0, // Not used in master mode
-                InterruptType::to_native(config.intr_flags) as _,
-            )
-        })?;
-
-        if let Some(timeout) = config.timeout {
-            esp!(unsafe { i2c_set_timeout(I2C::port(), timeout.0) })?;
-        }
+        let mut bus_handle: i2c_master_bus_handle_t = core::ptr::null_mut();
+        esp!(unsafe { i2c_new_master_bus(&bus_config, &mut bus_handle) })?;
 
         Ok(I2cDriver {
             i2c: I2C::port() as _,
+            bus_handle,
+            baudrate: config.baudrate.into(),
             _p: PhantomData,
         })
+    }
+
+    // Helper to create a temporary device handle for a transaction
+    fn create_device_handle(&self, addr: u8) -> Result<i2c_master_dev_handle_t, EspError> {
+        let dev_config = i2c_device_config_t {
+            dev_addr_length: i2c_addr_bit_len_t_I2C_ADDR_BIT_LEN_7,
+            device_address: addr as u16,
+            scl_speed_hz: self.baudrate,
+            scl_wait_us: 0,
+            flags: i2c_device_config_t__bindgen_ty_1 {
+                _bitfield_1: i2c_device_config_t__bindgen_ty_1::new_bitfield_1(0),
+                ..Default::default()
+            },
+        };
+
+        let mut dev_handle: i2c_master_dev_handle_t = core::ptr::null_mut();
+        esp!(unsafe { i2c_master_bus_add_device(self.bus_handle, &dev_config, &mut dev_handle) })?;
+        Ok(dev_handle)
     }
 
     pub fn read(
@@ -298,33 +317,34 @@ impl<'d> I2cDriver<'d> {
         buffer: &mut [u8],
         timeout: TickType_t,
     ) -> Result<(), EspError> {
-        let mut command_link = CommandLink::new()?;
-
-        command_link.master_start()?;
-        command_link.master_write_byte((addr << 1) | (i2c_rw_t_I2C_MASTER_READ as u8), true)?;
-
-        if !buffer.is_empty() {
-            command_link.master_read(buffer, AckType::LastNack)?;
+        if buffer.is_empty() {
+            return Ok(());
         }
 
-        command_link.master_stop()?;
-
-        self.cmd_begin(&command_link, timeout)
+        let dev_handle = self.create_device_handle(addr)?;
+        let result = esp!(unsafe {
+            i2c_master_receive(
+                dev_handle,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                timeout as i32,
+            )
+        });
+        unsafe { i2c_master_bus_rm_device(dev_handle) };
+        result
     }
 
     pub fn write(&mut self, addr: u8, bytes: &[u8], timeout: TickType_t) -> Result<(), EspError> {
-        let mut command_link = CommandLink::new()?;
-
-        command_link.master_start()?;
-        command_link.master_write_byte((addr << 1) | (i2c_rw_t_I2C_MASTER_WRITE as u8), true)?;
-
-        if !bytes.is_empty() {
-            command_link.master_write(bytes, true)?;
+        if bytes.is_empty() {
+            return Ok(());
         }
 
-        command_link.master_stop()?;
-
-        self.cmd_begin(&command_link, timeout)
+        let dev_handle = self.create_device_handle(addr)?;
+        let result = esp!(unsafe {
+            i2c_master_transmit(dev_handle, bytes.as_ptr(), bytes.len(), timeout as i32)
+        });
+        unsafe { i2c_master_bus_rm_device(dev_handle) };
+        result
     }
 
     pub fn write_read(
@@ -334,25 +354,19 @@ impl<'d> I2cDriver<'d> {
         buffer: &mut [u8],
         timeout: TickType_t,
     ) -> Result<(), EspError> {
-        let mut command_link = CommandLink::new()?;
-
-        command_link.master_start()?;
-        command_link.master_write_byte((addr << 1) | (i2c_rw_t_I2C_MASTER_WRITE as u8), true)?;
-
-        if !bytes.is_empty() {
-            command_link.master_write(bytes, true)?;
-        }
-
-        command_link.master_start()?;
-        command_link.master_write_byte((addr << 1) | (i2c_rw_t_I2C_MASTER_READ as u8), true)?;
-
-        if !buffer.is_empty() {
-            command_link.master_read(buffer, AckType::LastNack)?;
-        }
-
-        command_link.master_stop()?;
-
-        self.cmd_begin(&command_link, timeout)
+        let dev_handle = self.create_device_handle(addr)?;
+        let result = esp!(unsafe {
+            i2c_master_transmit_receive(
+                dev_handle,
+                bytes.as_ptr(),
+                bytes.len(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                timeout as i32,
+            )
+        });
+        unsafe { i2c_master_bus_rm_device(dev_handle) };
+        result
     }
 
     pub fn transaction(
@@ -361,61 +375,44 @@ impl<'d> I2cDriver<'d> {
         operations: &mut [Operation<'_>],
         timeout: TickType_t,
     ) -> Result<(), EspError> {
-        let mut command_link = CommandLink::new()?;
+        let dev_handle = self.create_device_handle(address)?;
 
-        let last_op_index = operations.len() - 1;
-        let mut prev_was_read = None;
-
-        for (i, operation) in operations.iter_mut().enumerate() {
-            match operation {
+        // Process operations sequentially
+        for operation in operations.iter_mut() {
+            let result = match operation {
                 Operation::Read(buf) => {
-                    if Some(true) != prev_was_read {
-                        command_link.master_start()?;
-                        command_link.master_write_byte(
-                            (address << 1) | (i2c_rw_t_I2C_MASTER_READ as u8),
-                            true,
-                        )?;
-                    }
-                    prev_was_read = Some(true);
-
-                    if !buf.is_empty() {
-                        let ack = if i == last_op_index {
-                            AckType::LastNack
-                        } else {
-                            AckType::Ack
-                        };
-
-                        command_link.master_read(buf, ack)?;
+                    if buf.is_empty() {
+                        Ok(())
+                    } else {
+                        esp!(unsafe {
+                            i2c_master_receive(
+                                dev_handle,
+                                buf.as_mut_ptr(),
+                                buf.len(),
+                                timeout as i32,
+                            )
+                        })
                     }
                 }
                 Operation::Write(buf) => {
-                    if Some(false) != prev_was_read {
-                        command_link.master_start()?;
-                        command_link.master_write_byte(
-                            (address << 1) | (i2c_rw_t_I2C_MASTER_WRITE as u8),
-                            true,
-                        )?;
-                    }
-                    prev_was_read = Some(false);
-
-                    if !buf.is_empty() {
-                        command_link.master_write(buf, true)?;
+                    if buf.is_empty() {
+                        Ok(())
+                    } else {
+                        esp!(unsafe {
+                            i2c_master_transmit(dev_handle, buf.as_ptr(), buf.len(), timeout as i32)
+                        })
                     }
                 }
+            };
+
+            if let Err(e) = result {
+                unsafe { i2c_master_bus_rm_device(dev_handle) };
+                return Err(e);
             }
         }
 
-        command_link.master_stop()?;
-
-        self.cmd_begin(&command_link, timeout)
-    }
-
-    fn cmd_begin(
-        &mut self,
-        command_link: &CommandLink,
-        timeout: TickType_t,
-    ) -> Result<(), EspError> {
-        esp!(unsafe { i2c_master_cmd_begin(self.port(), command_link.0, timeout) })
+        unsafe { i2c_master_bus_rm_device(dev_handle) };
+        Ok(())
     }
 
     pub fn port(&self) -> i2c_port_t {
@@ -425,7 +422,7 @@ impl<'d> I2cDriver<'d> {
 
 impl Drop for I2cDriver<'_> {
     fn drop(&mut self) {
-        esp!(unsafe { i2c_driver_delete(self.port()) }).unwrap();
+        unsafe { i2c_del_master_bus(self.bus_handle) };
     }
 }
 
@@ -492,11 +489,33 @@ fn to_i2c_err(err: EspError) -> I2cError {
 #[cfg(not(esp32c2))]
 pub struct I2cSlaveDriver<'d> {
     i2c: u8,
+    handle: i2c_slave_dev_handle_t,
+    rx_queue: crate::sys::QueueHandle_t,
     _p: PhantomData<&'d mut ()>,
 }
 
 #[cfg(not(esp32c2))]
 unsafe impl Send for I2cSlaveDriver<'_> {}
+
+#[cfg(not(esp32c2))]
+unsafe extern "C" fn i2c_slave_rx_done_callback(
+    _channel: i2c_slave_dev_handle_t,
+    edata: *const i2c_slave_rx_done_event_data_t,
+    user_data: *mut core::ffi::c_void,
+) -> bool {
+    if !edata.is_null() && !user_data.is_null() {
+        let queue = user_data as crate::sys::QueueHandle_t;
+        let mut high_task_wakeup: crate::sys::BaseType_t = 0;
+        crate::sys::xQueueGenericSendFromISR(
+            queue,
+            edata as *const core::ffi::c_void,
+            &mut high_task_wakeup,
+            0, // queueSEND_TO_BACK
+        );
+        return high_task_wakeup != 0;
+    }
+    false
+}
 
 #[cfg(not(esp32c2))]
 impl<'d> I2cSlaveDriver<'d> {
@@ -507,62 +526,111 @@ impl<'d> I2cSlaveDriver<'d> {
         slave_addr: u8,
         config: &config::SlaveConfig,
     ) -> Result<Self, EspError> {
-        let sys_config = i2c_config_t {
-            mode: i2c_mode_t_I2C_MODE_SLAVE,
+        // Use the new I2C slave device API
+        let sys_config = i2c_slave_config_t {
+            i2c_port: I2C::port() as i32,
             sda_io_num: sda.pin() as _,
-            sda_pullup_en: config.sda_pullup_enabled,
             scl_io_num: scl.pin() as _,
-            scl_pullup_en: config.scl_pullup_enabled,
-            __bindgen_anon_1: i2c_config_t__bindgen_ty_1 {
-                slave: i2c_config_t__bindgen_ty_1__bindgen_ty_2 {
-                    slave_addr: slave_addr as u16,
-                    addr_10bit_en: 0, // For now; to become configurable with embedded-hal V1.0
-                    maximum_speed: 0,
-                },
+            clk_source: soc_periph_i2c_clk_src_t_I2C_CLK_SRC_DEFAULT,
+            slave_addr: slave_addr as u16,
+            addr_bit_len: i2c_addr_bit_len_t_I2C_ADDR_BIT_LEN_7,
+            send_buf_depth: if config.tx_buf_len > 0 {
+                config.tx_buf_len as u32
+            } else {
+                256
             },
-            ..Default::default()
+            flags: i2c_slave_config_t__bindgen_ty_1 {
+                _bitfield_1: i2c_slave_config_t__bindgen_ty_1::new_bitfield_1(
+                    0, // stretch_en
+                    0, // broadcast_en
+                    0, // access_ram_en
+                    0, // slave_unmatch_en
+                    0, // allow_pd
+                ),
+                ..Default::default()
+            },
+            intr_priority: 0,
         };
 
-        esp!(unsafe { i2c_param_config(I2C::port(), &sys_config) })?;
+        let mut handle: i2c_slave_dev_handle_t = core::ptr::null_mut();
+        esp!(unsafe { i2c_new_slave_device(&sys_config, &mut handle) })?;
 
-        esp!(unsafe {
-            i2c_driver_install(
-                I2C::port(),
-                i2c_mode_t_I2C_MODE_SLAVE,
-                config.rx_buf_len,
-                config.tx_buf_len,
-                InterruptType::to_native(config.intr_flags) as _,
+        // Create queue for receiving callback notifications
+        let rx_queue = unsafe {
+            crate::sys::xQueueGenericCreate(
+                1,
+                core::mem::size_of::<i2c_slave_rx_done_event_data_t>() as u32,
+                0, // queueQUEUE_TYPE_BASE
             )
-        })?;
+        };
+
+        if rx_queue.is_null() {
+            unsafe { i2c_del_slave_device(handle) };
+            return Err(EspError::from_infallible::<ESP_ERR_NO_MEM>());
+        }
+
+        // Register the receive callback
+        let cbs = i2c_slave_event_callbacks_t {
+            on_stretch_occur: None,
+            on_recv_done: Some(i2c_slave_rx_done_callback),
+        };
+
+        if let Err(e) = esp!(unsafe {
+            i2c_slave_register_event_callbacks(handle, &cbs, rx_queue as *mut core::ffi::c_void)
+        }) {
+            unsafe {
+                crate::sys::vQueueDelete(rx_queue);
+                i2c_del_slave_device(handle);
+            }
+            return Err(e);
+        }
 
         Ok(Self {
             i2c: I2C::port() as _,
+            handle,
+            rx_queue,
             _p: PhantomData,
         })
     }
 
     pub fn read(&mut self, buffer: &mut [u8], timeout: TickType_t) -> Result<usize, EspError> {
-        let n = unsafe {
-            i2c_slave_read_buffer(self.port(), buffer.as_mut_ptr(), buffer.len(), timeout)
+        let buffer_len = buffer.len();
+
+        // Start non-blocking receive operation
+        esp!(unsafe { i2c_slave_receive(self.handle, buffer.as_mut_ptr(), buffer_len) })?;
+
+        // Wait for the callback to signal completion
+        let mut rx_data: i2c_slave_rx_done_event_data_t = unsafe { core::mem::zeroed() };
+        let received = unsafe {
+            crate::sys::xQueueReceive(
+                self.rx_queue,
+                &mut rx_data as *mut _ as *mut core::ffi::c_void,
+                timeout,
+            )
         };
 
-        if n > 0 {
-            Ok(n as usize)
+        if received != 0 {
+            // Successfully received data
+            // The buffer pointer should match our buffer, and the length is what we requested
+            // In the new I2C slave API, the receive completes when buffer_len bytes are received
+            Ok(buffer_len)
         } else {
             Err(EspError::from_infallible::<ESP_ERR_TIMEOUT>())
         }
     }
 
     pub fn write(&mut self, bytes: &[u8], timeout: TickType_t) -> Result<usize, EspError> {
-        let n = unsafe {
-            i2c_slave_write_buffer(self.port(), bytes.as_ptr(), bytes.len() as i32, timeout)
-        };
+        // Use the new non-blocking transmit API which returns immediately
+        esp!(unsafe {
+            i2c_slave_transmit(
+                self.handle,
+                bytes.as_ptr(),
+                bytes.len() as i32,
+                timeout as i32,
+            )
+        })?;
 
-        if n > 0 {
-            Ok(n as usize)
-        } else {
-            Err(EspError::from_infallible::<ESP_ERR_TIMEOUT>())
-        }
+        Ok(bytes.len())
     }
 
     pub fn port(&self) -> i2c_port_t {
@@ -573,56 +641,11 @@ impl<'d> I2cSlaveDriver<'d> {
 #[cfg(not(esp32c2))]
 impl Drop for I2cSlaveDriver<'_> {
     fn drop(&mut self) {
-        esp!(unsafe { i2c_driver_delete(self.port()) }).unwrap();
-    }
-}
-
-#[repr(u32)]
-enum AckType {
-    Ack = i2c_ack_type_t_I2C_MASTER_ACK,
-    #[allow(dead_code)]
-    Nack = i2c_ack_type_t_I2C_MASTER_NACK,
-    LastNack = i2c_ack_type_t_I2C_MASTER_LAST_NACK,
-}
-
-struct CommandLink<'buffers>(i2c_cmd_handle_t, PhantomData<&'buffers u8>);
-
-impl<'buffers> CommandLink<'buffers> {
-    fn new() -> Result<Self, EspError> {
-        let handle = unsafe { i2c_cmd_link_create() };
-
-        if handle.is_null() {
-            return Err(EspError::from_infallible::<ESP_ERR_NO_MEM>());
-        }
-
-        Ok(CommandLink(handle, PhantomData))
-    }
-
-    fn master_start(&mut self) -> Result<(), EspError> {
-        esp!(unsafe { i2c_master_start(self.0) })
-    }
-
-    fn master_stop(&mut self) -> Result<(), EspError> {
-        esp!(unsafe { i2c_master_stop(self.0) })
-    }
-
-    fn master_write_byte(&mut self, data: u8, ack_en: bool) -> Result<(), EspError> {
-        esp!(unsafe { i2c_master_write_byte(self.0, data, ack_en) })
-    }
-
-    fn master_write(&mut self, buf: &'buffers [u8], ack_en: bool) -> Result<(), EspError> {
-        esp!(unsafe { i2c_master_write(self.0, buf.as_ptr(), buf.len(), ack_en,) })
-    }
-
-    fn master_read(&mut self, buf: &'buffers mut [u8], ack: AckType) -> Result<(), EspError> {
-        esp!(unsafe { i2c_master_read(self.0, buf.as_mut_ptr().cast(), buf.len(), ack as u32,) })
-    }
-}
-
-impl Drop for CommandLink<'_> {
-    fn drop(&mut self) {
         unsafe {
-            i2c_cmd_link_delete(self.0);
+            // Delete the queue
+            crate::sys::vQueueDelete(self.rx_queue);
+            // Delete the I2C slave device
+            i2c_del_slave_device(self.handle);
         }
     }
 }
